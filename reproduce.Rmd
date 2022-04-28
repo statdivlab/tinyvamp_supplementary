@@ -1,0 +1,348 @@
+---
+title: "dada2_pipeline"
+author: "Lisa Karstens, Vincent Caruso"
+date: "April 22, 2019"
+output: pdf_document
+---
+
+This RMarkdown file documents the sequence processing for the data in the manuscript "Controlling for contaminants in low biomass 16S rRNA gene sequencing experiments".
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##Setup
+
+First, load required libraries.
+```{r libraries}
+library("dada2")
+library("stringr")
+library("ggplot2")
+library('here')
+```
+
+
+##Set up working directories
+Define the working directory and file paths.
+```{r paths}
+data_path <- here("RawData")     # parent directory for raw and filtered data
+dada2_path <- here("Processed")    # directory for outputs of DADA2 read processsing
+
+filt_path <- file.path(dada2_path, "filtered")    
+
+if (!file_test("-d", dada2_path)) dir.create(dada2_path)
+if (!file_test("-d", filt_path)) dir.create(filt_path)
+```
+
+
+##Filtering and Trimming
+
+Get raw data file names, split them into forward and reverse read files, and infer sample names from the file names.
+```{r plot qualities}
+
+file_names <- list.files(data_path)
+
+fastqs <- file_names[grepl(".fastq.gz", file_names)]
+trunc_Fs <- str_subset(fastqs, "_1.fastq")
+
+trunc_Rs <- str_subset(fastqs, "_2.fastq")
+#get the sample names
+sample.names <- sapply(strsplit(trunc_Fs, "-"), "[", 2)
+sample.names <- unlist(strsplit(sample.names,"_1.fastq.gz"))
+```
+
+Perform the filtering and trimming
+
+```{r filter}
+# Define file names for the filtered reads
+filt_Fs <- paste0(sample.names, "_filt_R1.fastq")
+filt_Rs <- paste0(sample.names, "_filt_R2.fastq")
+# Filter paired read sets
+filt_stats <- filterAndTrim(fwd = file.path(data_path, trunc_Fs), filt = file.path(filt_path, filt_Fs), rev = file.path(data_path, trunc_Rs), filt.rev = file.path(filt_path, filt_Rs), truncLen = c(230, 210), trimLeft = 15, maxEE = c(2.5, 2.5), truncQ = 2, rm.phix = TRUE, compress = FALSE, verbose = TRUE, multithread = TRUE)
+```
+
+
+## Error parameter estimation
+
+Learn the error rates from the data. This step was already completed, so we load in the errors.
+```{r errors}
+# load(file.path(dada2_path, 'dada2_errors.RData'))
+
+# Below is the initial code used to learn the errors
+err_F <- learnErrors(file.path(filt_path, filt_Fs), multithread = TRUE)
+err_R <- learnErrors(file.path(filt_path, filt_Rs), multithread = TRUE)
+```
+
+
+## Dereplication
+
+Collapse sequence replicates into single sequences, each with a summary of the quality scores at each base position.
+```{r dereplicate}
+derep_Fs <- derepFastq(file.path(filt_path, filt_Fs), verbose = TRUE)
+derep_Rs <- derepFastq(file.path(filt_path, filt_Rs), verbose = TRUE)
+
+```
+
+
+## Inference of sequence variants
+
+```{r SV inference}
+dada_Fs <- dada(derep_Fs, err = err_F, multithread = TRUE, pool = FALSE)
+dada_Rs <- dada(derep_Rs, err = err_R, multithread = TRUE, pool = FALSE)
+
+dada_Fs_pooled <-  dada(derep_Fs, err = err_F, multithread = TRUE, pool = TRUE)
+dada_Rs_pooled <- dada(derep_Rs, err = err_R, multithread = TRUE, pool = TRUE)
+# Save the dada objects
+save(err_F, err_R, derep_Fs, derep_Rs, dada_Fs, dada_Rs,
+     dada_Fs_pooled,
+     dada_Rs_pooled,
+     file = file.path(dada2_path, "dada2.RData"))
+load(file = file.path(dada2_path, "dada2.RData"))
+```
+
+
+## Merging of paired reads
+
+```{r merge SVs}
+#load(file = file.path(dada2_path, "dada2.RData"))
+mergers <- mergePairs(dada_Fs, derep_Fs, dada_Rs, derep_Rs, 
+                     verbose = TRUE)
+mergers_pooled <-  mergePairs(dada_Fs_pooled, derep_Fs, dada_Rs_pooled, derep_Rs, 
+                     verbose = TRUE)
+```
+
+
+##Create a sequence table
+
+This converts the inferred sequence data into a table, similar to an OTU table.
+```{r sequence table}
+sv_table <- makeSequenceTable(mergers)
+sv_table_pooled <- makeSequenceTable(mergers_pooled)
+row.names(sv_table) <- sample.names[!grepl("negative",sample.names)]
+row.names(sv_table_pooled) <- sample.names[!grepl("negative",sample.names)]
+print("Sequence lengths before length filtering:")
+table(nchar(getSequences(sv_table)))
+table(nchar(getSequences(sv_table_pooled)))
+ ```
+
+If there are any sequences with lengths outside the expected range for the V4 region, we remove them
+```{r remove bad lengths}
+min_len <- 221
+max_len <- 225
+sv_table <- sv_table[, nchar(getSequences(sv_table)) %in% seq(min_len, max_len)]
+print("Sequence lengths after length filtering:")
+table(nchar(getSequences(sv_table)))
+```
+
+
+##Remove chimeras
+
+DADA2 only considers "bimeras", or chimeras spawned from exactly two parents sequences.
+```{r remove chimeras}
+sv_table.no_chim <- removeBimeraDenovo(sv_table, method = "consensus", verbose = TRUE)
+sv_table_pooled.no_chim <- removeBimeraDenovo(sv_table_pooled, method = "consensus", verbose = TRUE)
+#check what percentage of reads remain
+print("Percentage of reads remaining after bimera removal:")
+sum(sv_table.no_chim) / sum(sv_table)
+sum(sv_table_pooled.no_chim) / sum(sv_table_pooled)
+```
+
+
+##Track read retention through the pipeline
+
+See how many reads were retained or discarded at each stage of processing.
+```{r track reads}
+getN <- function(x) sum(getUniques(x))
+if (length(sample.names) > 1){
+  track_table <- cbind(filt_stats, sapply(dada_Fs, getN), sapply(mergers, getN), rowSums(sv_table), rowSums(sv_table.no_chim))
+} else {
+  track_table <- cbind(filt_stats, getN(dada_Fs), getN(mergers), sum(sv_table), sum(sv_table.no_chim))
+}
+colnames(track_table) <- c("raw", "filtered", "denoised", "merged", "tabled", "non_chim")
+rownames(track_table) <- sample.names
+print("Read counts at each stage of the DADA2 pipeline:")
+track_table
+
+if (length(sample.names) > 1){
+  track_table_ <- cbind(filt_stats, sapply(dada_Fs, getN), sapply(mergers, getN), rowSums(sv_table), rowSums(sv_table.no_chim))
+} else {
+  track_table <- cbind(filt_stats, getN(dada_Fs), getN(mergers), sum(sv_table), sum(sv_table.no_chim))
+}
+colnames(track_table) <- c("raw", "filtered", "denoised", "merged", "tabled", "non_chim")
+rownames(track_table) <- sample.names
+print("Read counts at each stage of the DADA2 pipeline:")
+track_table
+save(mergers,
+     mergers_pooled,
+     sv_table, sv_table.no_chim,
+     sv_table_pooled, sv_table_pooled.no_chim,
+     file = file.path(dada2_path, "tables.RData"))
+write.table(sv_table.no_chim, file = file.path(dada2_path, "sv_table.no_chim.txt"), quote = FALSE, sep = "\t")
+
+```
+## Assign taxonomy
+
+```{r}
+
+taxa <- assignTaxonomy(sv_table.no_chim,  "silva_nr99_v138.1_wSpecies_train_set.fa.gz")
+taxa_pooled <- assignTaxonomy(sv_table_pooled.no_chim,  "silva_nr99_v138.1_wSpecies_train_set.fa.gz")
+spec_pooled <- assignSpecies(sv_table_pooled.no_chim, "silva_species_assignment_v138.1.fa.gz")
+# colnames(taxa) <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus")
+
+
+unname(head(taxa))
+unname(head(taxa_pooled))
+unname(head(spec_pooled))
+
+rownames(taxa) <- paste("ASV",1:nrow(taxa), sep = "_")
+
+rownames(taxa_pooled) <- paste("ASV",1:nrow(taxa_pooled), sep = "_")
+
+colnames(sv_table.no_chim) <- rownames(taxa)
+colnames(sv_table_pooled.no_chim) <- rownames(taxa_pooled)
+
+# Create phyloseq object
+map<-read.delim('map.csv', sep = ',',header = TRUE, row.names =1) 
+
+# Identify missing samples (samples with no sequences after Dada2 processing)
+all_samples<-rownames(map)
+# map <- map[map$SampleDescription != "Urine Extraction Blank",]
+rownames(map) <- c("_undiluted",
+                         "_1_3_dilution",
+                         "_1_9_dilution",
+                         "_1_27_dilution",
+                         "_1_81_dilution",
+                         "_1_243_dilution",
+                         "_1_729_dilution",
+                         "_1_2187_dilution",
+                         "_1_6561_dilution",
+                   "_negative_control")
+
+sv_table.no_chim %>% rownames
+
+rownames(sv_table.no_chim) <- map[rownames(sv_table.no_chim),"X.SampleID"]
+rownames(sv_table_pooled.no_chim) <- map[rownames(sv_table_pooled.no_chim),"X.SampleID"]
+rownames(map) <- map$X.SampleID
+
+processed_samples<-rownames(sv_table.no_chim)
+setdiff(all_samples, processed_samples)
+#No differences, all samples survived
+
+
+library(phyloseq)
+ps <- phyloseq(otu_table(sv_table.no_chim, taxa_are_rows=FALSE), 
+               sample_data(map), 
+               tax_table(taxa))
+
+
+
+ps_pooled <- phyloseq(otu_table(sv_table_pooled.no_chim, taxa_are_rows=FALSE), 
+               sample_data(map), 
+               tax_table(taxa_pooled))
+
+ps_pooled@otu_table %>% View()
+
+
+
+
+ps_species <-  tax_glom(ps,"Species",NArm = FALSE)
+ps_pooled_species <- tax_glom(ps_pooled,"Species",NArm = FALSE)
+
+ps_pooled_species@tax_table %>% View()
+
+save(ps,
+     ps_pooled,
+     ps_species,
+     ps_pooled_species,
+     file = file.path(dada2_path, "phyloseq.RData"))
+
+par(mfrow = c(1,2))
+
+plot(c(NA,0:8), log(ps_pooled_species@otu_table[,9]/ps_pooled_species@otu_table[,1]),
+     asp = 1,
+     ylim = c(-9,2),
+     xlab = "Dilution (Power of 3",
+     ylab = "Log(Reads in ASV X) - log(reads in ASV 1)",
+     main = "Log Ratios of Reads in Spurious ASVs to ASV 1 
+     (Limosilactobacillus -- in Mock by Design)
+     vs. Dilution")
+
+lines(c(NA,0:8), log(ps_pooled_species@otu_table[,9]/ps_pooled_species@otu_table[,1]),
+     asp = 1,
+     ylim = c(-12,5),
+lty =2)
+
+
+points(c(NA,0:8), log(ps_pooled_species@otu_table[,13]/ps_pooled_species@otu_table[,1]),
+     asp = 1,
+     ylim = c(-12,1))
+
+lines(c(NA,0:8), log(ps_pooled_species@otu_table[,13]/ps_pooled_species@otu_table[,1]),
+     asp = 1,
+     ylim = c(-12,1),
+lty =3)
+
+points(c(NA,0:8), log(ps_pooled_species@otu_table[,14]/ps_pooled_species@otu_table[,1]),
+     asp = 1,
+     ylim = c(-12,1))
+
+lines(c(NA,0:8), log(ps_pooled_species@otu_table[,14]/ps_pooled_species@otu_table[,1]),
+     asp = 1,
+     ylim = c(-12,1),
+lty =4)
+
+abline(a = -8, b = 1, col = "red", lty = 6)
+
+plot(c(NA,0:8), log(ps_pooled_species@otu_table[,10]/ps_pooled_species@otu_table[,1]),
+     asp = 1,
+     ylim = c(-9,2),
+     xlab = "Dilution (Power of 3",
+     ylab = "Log(Reads in ASV X) - log(reads in ASV 1)",
+     main = "Log Ratios of Reads in Spurious ASVs to ASV 1 
+     (Limosilactobacillus -- in Mock by Design)
+     vs. Dilution")
+
+lines(c(NA,0:8), log(ps_pooled_species@otu_table[,10]/ps_pooled_species@otu_table[,1]),
+     asp = 1,
+     ylim = c(-12,1),
+lty =2)
+
+
+
+
+
+
+
+
+# Display summary of phyloseq object
+ps
+
+#change sample names to indicate dilution
+sample_names(ps) <- sample_data(ps)$X.SampleID
+
+# rename taxa to make plotting/summarizing easier later
+# create key of original sequences
+asv_key <- cbind(asv_name = paste0("ASV_", seq(ntaxa(ps))), asv_sequence = taxa_names(ps))
+taxa_names(ps) <- paste0("ASV_", seq(ntaxa(ps)))
+asv_key <- as.data.frame(asv_key)
+
+# create phyloseq object with only the blank control
+blank_ps <- subset_samples(ps, SampleType == "Blank")
+blank_ps <- subset_taxa(blank_ps, taxa_sums(blank_ps)>0)
+
+# create phyloseq object with only the mock community samples
+mock_ps <- subset_samples(ps, SampleType == "MockCommunity")
+mock_ps <- subset_taxa(mock_ps, taxa_sums(mock_ps)>0)
+
+save.image(file.path(dada2_path,"dada2Processed.RData"))
+
+# create limited dataset with only the phyloseq objects and asv key
+vars_to_keep <- c("ps", "mock_ps", "blank_ps", "asv_key")
+vars_to_rm <- ls()
+vars_to_rm <-vars_to_rm[!vars_to_rm %in% vars_to_keep]
+rm(list = vars_to_rm)
+
+save.image(file.path(dada2_path,"mockDilutions.RData"))
+
+
+```
